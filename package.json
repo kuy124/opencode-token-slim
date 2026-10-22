@@ -23,6 +23,7 @@
     "snip-test.ts",
     "report-test.ts",
     "quality-test.ts",
+    "stress-test.ts",
     "quality-live.ts",
     "regress-test.mjs"
   ],
@@ -49,7 +50,7 @@
     "node": ">=22.6.0"
   },
   "scripts": {
-    "test": "node --experimental-strip-types test.ts && node --experimental-strip-types digest-test.ts && node --experimental-strip-types counters-test.ts && node --experimental-strip-types itemid-test.ts && node --experimental-strip-types plugin-test.ts && node --experimental-strip-types protect-test.ts && node --experimental-strip-types snip-test.ts && node --experimental-strip-types report-test.ts && node --experimental-strip-types quality-test.ts && node regress-test.mjs",
+    "test": "node --experimental-strip-types test.ts && node --experimental-strip-types digest-test.ts && node --experimental-strip-types counters-test.ts && node --experimental-strip-types itemid-test.ts && node --experimental-strip-types plugin-test.ts && node --experimental-strip-types protect-test.ts && node --experimental-strip-types snip-test.ts && node --experimental-strip-types report-test.ts && node --experimental-strip-types quality-test.ts && node --experimental-strip-types stress-test.ts && node regress-test.mjs",
     "bench": "node --experimental-strip-types bench.ts",
     "consistency": "node --experimental-strip-types consistency.ts",
     "quality-live": "node --experimental-strip-types quality-live.ts",

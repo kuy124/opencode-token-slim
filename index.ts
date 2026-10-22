@@ -397,8 +397,12 @@ export function takeTail(text: string, budget: number): string {
  */
 export function matchesPattern(candidate: string, pattern: string): boolean {
   if (!pattern) return false
-  const c = candidate.replace(/\\/g, "/")
-  const p = pattern.replace(/\\/g, "/")
+  // Windows paths are case-insensitive: `f:\games\code\slim` and
+  // `F:\GAMES\Code\slim` are one directory. Protection that ignored case would
+  // let a model that writes the path differently read a truncated file.
+  const fold = (s: string) => (process.platform === "win32" ? s.toLowerCase() : s)
+  const c = fold(candidate.replace(/\\/g, "/"))
+  const p = fold(pattern.replace(/\\/g, "/"))
   if (c === p) return true
   // A plain path (no wildcard) protects the whole subtree.
   if (!/[*?[\]]/.test(p)) {
@@ -429,8 +433,17 @@ export function matchesPattern(candidate: string, pattern: string): boolean {
  */
 export function isProtectedPath(candidate: string, patterns: string[]): boolean {
   if (!candidate) return false
-  if (matchesPattern(candidate, SELF_DIR)) return true
+  // A path is resolved before matching, so an explicitly relative one
+  // (`./src/index.ts`, `../slim/index.ts`) can still hit an absolute pattern.
+  // A BARE relative name (`f0.txt`) is left alone: it says nothing about where
+  // it is, and resolving it against our own cwd would make every file in the
+  // plugin's directory look protected, so a session running in that directory
+  // would stop trimming its call arguments altogether.
+  const located = path.isAbsolute(candidate) || candidate.startsWith(".")
+  const abs = located ? path.resolve(candidate) : candidate
+  if (matchesPattern(abs, SELF_DIR)) return true
   for (const pattern of patterns) {
+    if (matchesPattern(abs, path.resolve(pattern))) return true
     if (matchesPattern(candidate, pattern)) return true
   }
   return false
@@ -819,6 +832,9 @@ export function trimCallInput(input: any): { input: any; changed: boolean; saved
   if (!input || typeof input !== "object") return { input, changed: false, saved: 0 }
   let saved = 0
   const walk = (value: any, depth: number): any => {
+    // ponytail: the walk gives up past depth 6 rather than risk a cycle in a
+    // hand-built input. A real tool argument is two or three deep (path +
+    // content); raise the cap if a tool ever nests deeper.
     if (depth > 6) return value
     if (typeof value === "string") {
       if (bytes(value) <= CALL_ARG_KEEP) return value
@@ -937,6 +953,37 @@ export function quantize(position: number, step: number): number {
 export type Band = "keep" | "digest" | "elide"
 
 /**
+ * The cost of a part for BAND placement.
+ *
+ * A trimmed result is a marker plus a head and a tail, but its place in the
+ * history is where the WHOLE result sat: the full text is still on disk, and
+ * the stream is measured as if it were still in place. The current size is
+ * the wrong measure because it depends on how much of the history has already
+ * been trimmed — so the measure changes every time a part is trimmed. The
+ * boundary then drifts backwards, a result that had a digest falls "inside
+ * the kept region", the undo path makes it whole again, and the next request
+ * digests it again: the payload flips between two sizes on every turn, and
+ * every flip is a prompt-cache miss.
+ */
+function streamCost(part: any, opts: SlimOptions): number {
+  const cost = partCost(part)
+  if (part?.type !== "tool-result") return cost
+  const text = resultText(part)
+  if (text === undefined) return cost
+  if (!isCacheMarker(text, opts)) return cost
+  const file = markerPath(text)
+  if (file === undefined) return cost
+  try {
+    // The envelope (result type, ids) is the same before and after, so putting
+    // the original text size back in place of the marker recovers the cost the
+    // part had when it was whole.
+    return cost - bytes(text) + fs.statSync(file).size
+  } catch {
+    return cost
+  }
+}
+
+/**
  * Decide each part's fate, from a byte budget and a stable cut.
  *
  * The parts of one kind are laid out in a byte stream, oldest first. The
@@ -944,18 +991,22 @@ export type Band = "keep" | "digest" | "elide"
  * says how much of the middle gets a digest, and the rest is old: a pointer,
  * a drop, a trim.
  *
- * The boundaries between the bands are byte positions measured from the
- * START of the stream, and they are quantized to a step. The history only
- * grows at the end, so a position measured from the start means the same
- * thing on every request. Rounding it down to a step means the boundaries
- * only MOVE when a whole step has accumulated, and between moves every part
- * keeps the same fate and the request is byte-identical — so the provider's
- * prompt cache still hits.
+ * The boundaries are measured from the NEWEST end, because that is the end
+ * that does not move. Measured from the start, a part's position is the total
+ * size of everything older than it — and that total shrinks as older parts
+ * are trimmed, so the same boundary lands somewhere else after every pass.
+ * Measured from the end, a part's distance is the size of everything newer
+ * than it, which trimming never changes.
  *
- * A part is placed by where it STARTS. A part that straddles a boundary
- * belongs to the older band, so one huge part cannot smuggle itself into the
- * kept region whole. The kept region is the newest `budget` bytes, give or
- * take one part and one step.
+ * The distances are quantized to a step. The history grows at the newest end,
+ * so the distance of every older part grows with it, and the boundaries only
+ * MOVE when a whole step has accumulated. Between moves every part keeps the
+ * same fate and the request is byte-identical — so the provider's prompt cache
+ * still hits.
+ *
+ * A part that straddles a boundary belongs to the older band, so one huge
+ * part cannot smuggle itself into the kept region whole. The kept region is
+ * the newest `budget` bytes, give or take one part and one step.
  *
  * Two things are kept whatever the budget says: the newest part of each
  * kind, because it is what the model is looking at right now, and — for
@@ -969,30 +1020,18 @@ export function assignBands(
 ): Map<number, Band> {
   const bands = new Map<number, Band>()
   if (parts.length === 0) return bands
-  const budget = budgetForKind(kind, opts)
-  const step = stairForKind(kind, opts)
+  const keepBudget = budgetForKind(kind, opts)
   const digestBudget = kind === "tool-result" ? opts.resultDigestBytes : 0
+  const step = stairForKind(kind, opts)
 
-  // The stream: each part's start position, measured from the start.
-  const starts: number[] = []
-  const costs: number[] = []
-  let total = 0
-  for (const p of parts) {
-    starts.push(total)
-    const cost = partCost(p.part)
-    costs.push(cost)
-    total += cost
-  }
-
-  // The boundaries, quantized so they only move on a step boundary. Rounding
-  // down keeps a little MORE than the budget, which is the safe direction:
-  // the cut can never leave the model with less than it asked for.
-  const keepBoundary = quantize(total - budget, step)
-  const digestBoundary = Math.max(0, quantize(total - budget - digestBudget, step))
-
-  for (let i = 0; i < parts.length; i++) {
-    const start = starts[i]
-    const band: Band = start >= keepBoundary ? "keep" : start >= digestBoundary ? "digest" : "elide"
+  let acc = 0
+  for (let i = parts.length - 1; i >= 0; i--) {
+    acc += streamCost(parts[i].part, opts)
+    // Rounded down: a part keeps the newer band until a whole step of content
+    // has accumulated behind it, so the cut cannot creep on every turn.
+    const distance = quantize(acc, step)
+    const band: Band =
+      distance <= keepBudget ? "keep" : distance <= keepBudget + digestBudget ? "digest" : "elide"
     bands.set(parts[i].index, band)
   }
 
@@ -1009,8 +1048,9 @@ export function assignBands(
   if (floor > 0) {
     let spent = 0
     for (let i = parts.length - 1; i >= 0; i--) {
-      if (i < parts.length - 1 && spent + costs[i] > floor) break
-      spent += costs[i]
+      const cost = partCost(parts[i].part)
+      if (i < parts.length - 1 && spent + cost > floor) break
+      spent += cost
       bands.set(parts[i].index, "keep")
     }
   }
@@ -1340,7 +1380,29 @@ export function elideToPointer(
  * more `]` on every request.
  */
 export function markerPath(text: string): string | undefined {
+  // Not anchored: a digest puts its marker between the head and the tail, so
+  // the path it names is the first marker in the value. A text that merely
+  // QUOTES a marker (a grep over this file, a pasted `/slim-stats` report)
+  // therefore parses too — which is why every caller that acts on the path
+  // checks it with `isCacheMarker` first. Anchoring here would be wrong: it
+  // would stop every digest from being restorable.
   return /\[slim:[^\]]*?Full (?:output|text): ([^\s\]]+)/.exec(text)?.[1]
+}
+
+/**
+ * Is this text a marker the plugin wrote, rather than a text that quotes one?
+ *
+ * The test is the destination, not the shape: only a file inside the plugin's
+ * own cache directory is one of ours. Without it, a result holding a line like
+ * `[slim: … Full text: C:\Windows\win.ini]` is mistaken for an already-elided
+ * result and is never trimmed — the grep output of this very file is the
+ * smallest example.
+ */
+export function isCacheMarker(text: string, opts: SlimOptions): boolean {
+  const file = markerPath(text)
+  if (file === undefined) return false
+  const root = path.resolve(opts.directory)
+  return path.resolve(file).startsWith(root + path.sep)
 }
 
 /**
@@ -1422,11 +1484,14 @@ export function restorePart(part: any, full: string): any {
 export function resultText(part: any): string | undefined {
   const result = part?.result
   if (result?.type === "text" && typeof result.value === "string") return result.value
-  if (result?.type === "content" && Array.isArray(result.value))
-    return result.value
-      .filter((item: any) => item?.type === "text")
+  if (result?.type === "content" && Array.isArray(result.value)) {
+    const texts = result.value
+      .filter((item: any) => item?.type === "text" && typeof item.text === "string")
       .map((item: any) => item.text)
-      .join("\n")
+    // `""` and `undefined` are treated the same by every caller, but only one
+    // of them is honest: a result with no text items has no text.
+    return texts.length > 0 ? texts.join("\n") : undefined
+  }
   return undefined
 }
 
@@ -1470,7 +1535,11 @@ export function elideImages(part: any, toolName: string) {
       type: "text",
       text: `[slim: ${toolName} image, ${mime}, ${kb} KB, elided - read${where} again if needed]`,
     }
-    saved += bytes(JSON.stringify(item)) - bytes(JSON.stringify(pointer))
+    // A remote url is 40 bytes and the pointer is 120: eliding that GROWS the
+    // payload, which is the one thing the plugin must never do.
+    const gain = bytes(JSON.stringify(item)) - bytes(JSON.stringify(pointer))
+    if (gain <= 0) return item
+    saved += gain
     touched = true
     created.push(pointer)
     return pointer
@@ -1901,6 +1970,9 @@ export default {
       let textElided = 0
       let textBytes = 0
       let partIndex = 0
+      // Did this request drop anything from the messages? The brief is only
+      // worth its bytes when it has something to explain.
+      let trimmed = false
 
       const flat = flattenParts(messages)
       // The bands, per kind of content. Each kind gets its own byte stream
@@ -2036,6 +2108,16 @@ export default {
               kept.push(live)
               continue
             }
+            // A text that already names one of OUR cache files is a digest or
+            // a pointer: replacing it again would cost the same bytes and
+            // point at a file holding the marker, so the model would need two
+            // hops to reach the data. The test is the destination, not the
+            // shape — a result that merely quotes a marker (a grep over this
+            // file, a pasted report) still gets trimmed like any other text.
+            if (isCacheMarker(text, opts)) {
+              kept.push(live)
+              continue
+            }
             // The middle band is the one the model may still be working
             // with, so it keeps the head and the tail. The old band only
             // needs to say that the result existed and where to find it.
@@ -2045,18 +2127,12 @@ export default {
             // than to nothing. A digest costs bytes; losing the content
             // costs the model its ability to answer.
             const name = live.name ?? "result"
-            // A text that already carries a marker IS a digest: its original
-            // is on disk. Digesting it again costs the same bytes and points
-            // at a file holding the digest instead of the original, so the
-            // model would have to make two hops to get back to the data.
             const replacement =
               band === "elide"
                 ? (elideToPointer(text, opts, name, size) ??
                   digestJson(text, opts, name) ??
                   digestResult(text, opts, name))
-                : marker
-                  ? undefined
-                  : (digestJson(text, opts, name) ?? digestResult(text, opts, name))
+                : (digestJson(text, opts, name) ?? digestResult(text, opts, name))
             if (replacement === undefined) {
               kept.push(live)
               continue
@@ -2169,7 +2245,10 @@ export default {
 
           kept.push(part)
         }
-        if (changed) message.content = kept
+        if (changed) {
+          message.content = kept
+          trimmed = true
+        }
       }
       // The full-output directory is a cache, not an archive. One scan per
       // request is enough; the throttle inside the scan makes it one a minute.
@@ -2294,7 +2373,15 @@ export default {
       // 2e. The behaviour brief. Constant bytes, so it does not disturb the
       //     cached system prefix. It is added AFTER the measurement above, so
       //     it is not counted as either a saving or a growth.
-      if (Array.isArray(event.system) && !event.system.some((p: any) => (p.text ?? "").startsWith("## Context discipline"))) {
+      //
+      //     Only when something was actually trimmed: 800 bytes of advice on a
+      //     request where nothing was elided is pure growth, and a short
+      //     session would pay for it on every turn.
+      if (
+        trimmed &&
+        Array.isArray(event.system) &&
+        !event.system.some((p: any) => (p.text ?? "").startsWith("## Context discipline"))
+      ) {
         event.system = [...event.system, { type: "text", text: BRIEF }]
         ledger.set({ briefBytes: bytes(BRIEF) })
       }
@@ -2465,7 +2552,13 @@ export const MIN_DESCRIPTION = 240
  * replay. Such a part must be sent back byte-identical, so it is never touched.
  */
 export function carriesSignature(part: any): boolean {
+  // Only a reasoning part is replayed with a signature; anything else is not
+  // this function's business, whatever fields it carries.
+  if (part?.type !== "reasoning") return false
   if (typeof part.encrypted === "string" && part.encrypted.length > 0) return true
+  // Some dialects put the signature on the part rather than in the metadata.
+  if (typeof part.signature === "string" && part.signature.length > 0) return true
+  if (typeof part.redactedData === "string" && part.redactedData.length > 0) return true
   const meta = part.providerMetadata
   if (!meta || typeof meta !== "object") return false
   for (const value of Object.values(meta)) {

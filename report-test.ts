@@ -51,19 +51,21 @@ const OPTS = { keepFullOutput: false }
   const pct = Number(description.match(/(\d+)% smaller than the untrimmed history/)?.[1] ?? -999)
   assert.ok(pct >= 0, `a session that trims nothing must not report a loss: ${pct}%\n${description}`)
 
-  // The full report is in the file the description points at, and the brief
-  // is reported there on its own line, so it cannot be mistaken for a saving.
+  // The full report is in the file the description points at. Nothing was
+  // trimmed here, so the brief was not added either — and the report must not
+  // claim it was, because a request that trims nothing must not grow by 800
+  // bytes of advice.
   const file = description.match(/full report: ([^)\s]+)/)?.[1]
   assert.ok(file, `the description must point at the full report:\n${description}`)
   const full = readFileSync(file!, "utf8")
-  assert.ok(/brief added:\s+\S+/.test(full), `the brief must be reported separately:\n${full}`)
+  assert.ok(!/brief added:/.test(full), `a request that trims nothing must not pay for the brief:\n${full}`)
+  assert.ok(
+    !/Actually sent, including the brief:/.test(full),
+    `the report must not describe a brief that was not added:\n${full}`,
+  )
   assert.ok(
     /This request \(trimmed, before the brief is added\):/.test(full),
     `the full report must state the trimmed size:\n${full}`,
-  )
-  assert.ok(
-    /Actually sent, including the brief:/.test(full),
-    `the full report must state what was actually sent:\n${full}`,
   )
 }
 
@@ -102,6 +104,14 @@ const OPTS = { keepFullOutput: false }
     /tool results:\s+[\d.]+\s*[KM]?B/.test(report),
     `the tool result saving must be reported:\n${report}`,
   )
+
+  // Something WAS trimmed, so the brief is added and has to be reported on its
+  // own line: it is a cost, and a report that hides it is a lie.
+  const file = report.match(/full report: ([^)\s]+)/)?.[1]
+  assert.ok(file, `the description must point at the full report:\n${report}`)
+  const full = readFileSync(file!, "utf8")
+  assert.ok(/brief added:\s+\S+/.test(full), `a trimmed request must report the brief:\n${full}`)
+  assert.ok(/Actually sent, including the brief:/.test(full), `the report must state what was sent:\n${full}`)
 }
 
 // --- 3. the TUI can only show ONE line, so the description must be one line --

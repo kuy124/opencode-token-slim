@@ -192,7 +192,9 @@ const reasoningCount = (messages) =>
             value: [
               { type: "text", text: big },
               { type: "file", uri: "data:application/pdf;base64,AAA", mime: "application/pdf" },
-              { type: "file", uri: "data:image/png;base64,AAA", mime: "image/png", name: "shot.png" },
+              // 3 KB of base64: a 40-byte data uri would be smaller than the
+              // pointer that replaces it, and the plugin must never grow.
+              { type: "file", uri: "data:image/png;base64," + "A".repeat(3_000), mime: "image/png", name: "shot.png" },
             ],
           },
         },

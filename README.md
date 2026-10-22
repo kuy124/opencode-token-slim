@@ -14,7 +14,7 @@ the request.
 | tokens on a coding task | **48% fewer** (29,319 → 15,190, three runs each way) |
 | payload, long coding session | **81% smaller** (5.4 MB → 1.04 MB) |
 | payload, screenshot-heavy session | **97% smaller** (52.6 MB → 1.6 MB) |
-| quality | **33 of 33** comprehension checks, plugin on and off |
+| quality | the same answers with the plugin on and off, on 6 tasks that need a real model (see [Quality](#quality)) |
 | cost when idle | nothing; it never calls the network |
 
 - [Why](#why) · [Install](#install) · [What it does](#what-it-does) ·
@@ -261,18 +261,35 @@ it, and climbs back as it ages out.
 ## Quality
 
 The question that matters is not "how small" but "did the answer change".
+Three things are checked offline, on every `npm test`:
 
-- `quality-test.ts` — 33 checks on a text that has to be understood, not
-  summarised: overlapping ranges, a trap where two versions of a rule
-  contradict each other, a table that has to be read in order. **33 of 33 with
-  the plugin off, 33 of 33 with it on.**
+- `quality-test.ts` — the newest reasoning, result and call are kept whole,
+  every elided result names a file that exists and holds the original text,
+  and every digest is the real head and tail of the result it replaces.
+- `stress-test.ts` — **224 assertions** over the trimmers themselves: a
+  corpus of hostile inputs (a megabyte on one line, NUL bytes, CRLF, a png in
+  a text slot, text that quotes a marker) times the invariants that must hold
+  for all of them, plus the boundaries a corpus cannot see (a 199/200/329/400
+  byte argument, a protected path that is a prefix of another, a step edge).
+  The suite refuses to run fewer than 100 checks, so the number in this README
+  cannot drift.
+- `regress-test.mjs` — every bug found in production, written the way it
+  failed.
+
+`quality-live.ts` is the one that needs a model: 6 tasks against a real
+session, plugin off and then on, each answer checked against a value computed
+in the script. Run it with `npm run quality-live`.
+
+Three rules hold whatever the suite says:
+
 - The digests are conservative on purpose. A result is never replaced by a
   summary an LLM wrote; it is replaced by its own head and tail, or by a
   pointer to the exact bytes.
 - A result whose text is protected (`protectPaths`, `protectTools`, or the
   plugin's own source) is never trimmed.
 - The payload never grows: any replacement bigger than what it replaces is
-  dropped.
+  dropped, and the behaviour brief is only added to a request that was
+  actually trimmed.
 
 ## Safety
 
@@ -425,7 +442,7 @@ Bugs this report has had, all of them found by not believing it:
 
 ## Tests
 
-Ten suites, no network, no fixtures:
+Eleven suites, no network, no fixtures:
 
 | file | what it pins down |
 |---|---|
@@ -437,14 +454,15 @@ Ten suites, no network, no fixtures:
 | `protect-test.ts` | protected paths and tools are untouched, in arguments too |
 | `snip-test.ts` | snip's rewrite, its failure, its timeout, and Windows quoting |
 | `report-test.ts` | the report lines and their arithmetic |
-| `quality-test.ts` | 33 comprehension checks, on a payload the plugin trimmed |
+| `quality-test.ts` | the kept region, the files behind the markers, the digest shape |
+| `stress-test.ts` | 224 assertions: hostile content, exact boundaries, a fixed point |
 | `regress-test.mjs` | the bugs found in production, in the order they were found |
 
-`npm test` runs all ten. The regression suite is the interesting one: it exists
-because each of those bugs shipped, and the assertion for a bug is written the
-way it failed — a 2,000-call history that must still be trimmed, a 40 KB result
-that must still be a digest after an undo, an image pointer that must not be
-restored as text.
+That is eleven files, all run by `npm test` except the live one below. The
+regression suite is the interesting one: it exists because each of those bugs
+shipped, and the assertion for a bug is written the way it failed — a
+2,000-call history that must still be trimmed, a 40 KB result that must still
+be a digest after an undo, an image pointer that must not be restored as text.
 
 ### Benchmarks
 
