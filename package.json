@@ -1,0 +1,58 @@
+{
+  "name": "opencode-token-slim",
+  "version": "1.6.0",
+  "description": "Cuts the per-request payload an OpenCode agent sends to its model: old reasoning, oversized tool results, old screenshots, stale call arguments, and an oversized system prompt.",
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE",
+    "session.ts",
+    "bench.ts",
+    "consistency.ts",
+    "test.ts",
+    "digest-test.ts",
+    "counters-test.ts",
+    "itemid-test.ts",
+    "plugin-test.ts",
+    "protect-test.ts",
+    "snip-test.ts",
+    "report-test.ts",
+    "quality-test.ts",
+    "quality-live.ts",
+    "regress-test.mjs"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tokens",
+    "context",
+    "llm",
+    "context-window",
+    "prompt-cache"
+  ],
+  "license": "MIT",
+  "author": "Faris (https://github.com/kuy124)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kuy124/opencode-token-slim.git"
+  },
+  "homepage": "https://github.com/kuy124/opencode-token-slim#readme",
+  "bugs": {
+    "url": "https://github.com/kuy124/opencode-token-slim/issues"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types test.ts && node --experimental-strip-types digest-test.ts && node --experimental-strip-types counters-test.ts && node --experimental-strip-types itemid-test.ts && node --experimental-strip-types plugin-test.ts && node --experimental-strip-types protect-test.ts && node --experimental-strip-types snip-test.ts && node --experimental-strip-types report-test.ts && node --experimental-strip-types quality-test.ts && node regress-test.mjs",
+    "bench": "node --experimental-strip-types bench.ts",
+    "consistency": "node --experimental-strip-types consistency.ts",
+    "quality-live": "node --experimental-strip-types quality-live.ts",
+    "prepublishOnly": "npm test"
+  }
+}

@@ -1,0 +1,3 @@
+# Keep LF in the repository on every platform: the plugin is run by Bun and the
+# tarball should not differ between a Windows and a Linux checkout.
+* text=auto eol=lf

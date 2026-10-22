@@ -1,0 +1,11 @@
+node_modules/
+*.bak
+*.log
+
+# If `directory` or `statsDirectory` is pointed at the checkout, the cache
+# files must not be committed.
+slim-output/
+slim-stats/
+
+.DS_Store
+Thumbs.db
