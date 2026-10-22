@@ -266,7 +266,7 @@ Three things are checked offline, on every `npm test`:
 - `quality-test.ts` — the newest reasoning, result and call are kept whole,
   every elided result names a file that exists and holds the original text,
   and every digest is the real head and tail of the result it replaces.
-- `stress-test.ts` — **224 assertions** over the trimmers themselves: a
+- `stress-test.ts` — **270 assertions** over the trimmers themselves: a
   corpus of hostile inputs (a megabyte on one line, NUL bytes, CRLF, a png in
   a text slot, text that quotes a marker) times the invariants that must hold
   for all of them, plus the boundaries a corpus cannot see (a 199/200/329/400

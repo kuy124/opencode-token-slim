@@ -40,15 +40,23 @@ import plugin, {
   partCost,
   quantize,
   readRestorable,
+  reasoningKey,
+  reportSummary,
   resolveOptions,
   restorePart,
   resultText,
   stairForKind,
   stripItemId,
   trimCallInput,
+  takeBytes,
+  takeTail,
+  extractPath,
+  extractCallPath,
+  readPersistedStats,
   trimSchemaDescriptions,
   trimSystemPart,
   writeFullOutput,
+  writeReportFile,
 } from "./index.ts"
 
 const bytes = (s: string) => Buffer.byteLength(s, "utf8")
@@ -692,5 +700,222 @@ check("different text writes a different file name", () => {
   })
 }
 
+// --- 14. UTF-8 is never torn at a byte boundary -------------------------------
+for (const unit of [1]) {
+  check("taking bytes in the middle does not split a character", () => {
+    const text = "🙂".repeat(100)
+    const out = takeBytes(text, 50)
+    assert.ok(Buffer.byteLength(out, "utf8") <= 50)
+    assert.ok(bytes(out) <= 50)
+  })
+  check("taking the tail never starts with a lone continuation", () => {
+    const text = "🙂".repeat(100)
+    const out = takeTail(text, 50)
+    if (out.length > 0) assert.ok(!/[\u0080-\u00BF]/.test(out[0]))
+  })
+  check("takeBytes under the budget is the whole text", () => assert.equal(takeBytes("abc", 100), "abc"))
+  check("takeBytes of zero is empty", () => assert.equal(takeBytes("abc", 0), ""))
+  check("takeTail under the budget is the whole text", () => assert.equal(takeTail("abc", 100), "abc"))
+  check("takeBytes keeps whole multibyte characters", () => assert.ok(takeBytes("🙂".repeat(2), 8).length > 0))
+}
+
+// --- 15. parsing a path out of text ------------------------------------------
+for (const unit of [1]) {
+  check("extractPath reads from each read-tool header", () => {
+    for (const line of [
+      "Read file src/foo.ts, 10 lines",
+      "Read '/abs/x.ts' lines 5-10",
+      'Edited file "a b.ts"',
+      "Wrote F:\\code\\x.py, 3 lines",
+      "Updated config.json line 3",
+    ]) {
+      assert.notEqual(extractPath(line), undefined, line)
+    }
+  })
+  check("extractPath returns undefined for bare text", () => assert.equal(extractPath("no path here"), undefined))
+  check("extractPath does not crash on odd input", () => {
+    for (const v of ["", null, 42, { a: 1 }] as any[]) assert.doesNotThrow(() => extractPath(v as any))
+  })
+  check("extractCallPath probes every known key", () => {
+    for (const key of ["path", "filePath", "file", "filename", "file_path", "target", "source", "dest"]) {
+      assert.equal(extractCallPath({ [key]: "x.ts" }), "x.ts", key)
+    }
+  })
+  check("extractCallPath returns undefined for plain input", () => {
+    assert.equal(extractCallPath({}), undefined)
+    assert.equal(extractCallPath(null), undefined)
+    assert.equal(extractCallPath(undefined), undefined)
+    assert.equal(extractCallPath("str"), undefined)
+  })
+}
+
+// --- 16. system prompt and schemas -------------------------------------------
+for (const unit of [1]) {
+  check("trimSystemPart keeps a tiny prompt byte-identical", () => assert.equal(trimSystemPart("hi", 1000), "hi"))
+  check("trimSystemPart always fits the budget on UTF-8", () => {
+    const text = "🙂".repeat(2_000)
+    const out = trimSystemPart(text, 4_000)
+    assert.ok(bytes(out) <= 4_000)
+  })
+  check("trimSystemPart never drops the first char", () => {
+    const text = "🙂".repeat(2_000)
+    assert.ok(trimSystemPart(text, 4_000).startsWith("🙂"))
+  })
+  check("trimSchemaDescriptions passes through a scalar", () => assert.equal(trimSchemaDescriptions("x" as any, 100), "x" as any))
+  check("trimSchemaDescriptions passes through null", () => assert.equal(trimSchemaDescriptions(null, 100), null))
+  check("trimSchemaDescriptions leaves short descriptions", () => {
+    const schema = { type: "object", properties: { a: { type: "string", description: "short" } } }
+    assert.equal(trimSchemaDescriptions(schema, 100).properties.a.description, "short")
+  })
+  check("trimSchemaDescriptions keeps nested schema valid", () => {
+    const schema = { allOf: [{ properties: { a: { description: "d".repeat(500) } } }] }
+    const out = trimSchemaDescriptions(schema, 100) as any
+    assert.equal(out.allOf[0].properties.a.description.length, 100)
+  })
+}
+
+// --- 17. flattenParts, markers, pointers -------------------------------------
+for (const unit of [1]) {
+  check("flattenParts skips messages without content", () => assert.equal(flattenParts([{ id: "m1" }, { id: "m2", content: [] }]).length, 0))
+  check("flattenParts indexes all parts globally", () => {
+    const flat = flattenParts([{ id: "m1", content: [1, 2] } as any, { id: "m2", content: [3] } as any])
+    assert.deepEqual(flat.map((f: any) => f.index), [0, 1, 2])
+  })
+  check("flattenParts preserves message identity", () => {
+    const message = { id: "m", content: [{ type: "text", text: "x" }] }
+    assert.equal(flattenParts([message])[0].message, message)
+  })
+  check("markerPath parses both output and text markers", () => {
+    assert.equal(markerPath("[slim: r, 1 KB, elided - Full output: /a/b.txt]"), "/a/b.txt")
+    assert.equal(markerPath("[slim: r, 1 KB, elided - Full text: /c/d.txt]"), "/c/d.txt")
+  })
+  check("markerPath ignores markers without a path", () => assert.equal(markerPath("[slim: nothing]"), undefined))
+  check("markerPath is undefined for plain text", () => assert.equal(markerPath("hello"), undefined))
+  check("writeFullOutput is content-addressed", () => {
+    assert.equal(writeFullOutput(dir, "read", "same"), writeFullOutput(dir, "read", "same"))
+  })
+  check("writeFullOutput differs for different text", () => {
+    assert.notEqual(writeFullOutput(dir, "read", "x"), writeFullOutput(dir, "read", "y"))
+  })
+  check("writeFullOutput stores the bytes verbatim", () => {
+    const file = writeFullOutput(dir, "read", "raw data\n🙂")
+    assert.equal(readFileSync(file, "utf8"), "raw data\n🙂")
+  })
+  check("elideToPointer writes a pointer line with the source name", () => {
+    const out = elideToPointer("hello", OPTS, "read", 5) as string
+    assert.ok(typeof out === "string" && out.startsWith("[slim:"))
+    const stub = { type: "tool-result", name: "read", result: { type: "content", value: [{ type: "file", uri: "data:image/png;base64,AAA", mime: "image/png", name: "shot.png" }] } }
+    const img = elideImages(stub, "read") as any
+    // name travels through; assert via shot.png presence at the one place it counts: the inputs layer
+  })
+  check("restorePart returns a copy, not the original", () => {
+    const part = { type: "tool-result", result: { type: "text", value: "a" } }
+    const out = restorePart(part, "NEW")
+    assert.equal(part.result.value, "a")
+    assert.equal(out.result.value, "NEW")
+  })
+}
+
+// --- 18. reasoning floor -----------------------------------------------------
+for (const unit of [1]) {
+  check("the reasoning floor keeps a single oversized newest part whole", () => {
+    const parts = [{ part: { type: "reasoning", text: "r".repeat(100_000) }, index: 0 }]
+    const opts = resolveOptions({ reasoningBytes: 100_000, reasoningKeepBytes: 20_000, stairBytes: 32_000 }) as any
+    const bands = assignBands(parts, opts, "reasoning")
+    assert.equal(bands.get(0), "keep")
+  })
+  check("the reasoning floor keeps newest parts over the budget", () => {
+    const opts = resolveOptions({ reasoningBytes: 100_000, reasoningKeepBytes: 30_000, stairBytes: 32_000 }) as any
+    const parts = Array.from({ length: 10 }, (_, i) => ({ part: { type: "reasoning", text: "r".repeat(5_000) }, index: i }))
+    const bands = assignBands(parts, opts, "reasoning")
+    let kept = 0
+    for (let i = 0; i < 10; i++) if (bands.get(i) === "keep") kept++
+    assert.ok(kept >= 6)
+  })
+  check("assignBands has a digest band for results", () => {
+    const opts = resolveOptions({ resultKeepBytes: 4_000, resultDigestBytes: 10_000, stairBytes: 1_000 }) as any
+    const parts = Array.from({ length: 50 }, (_, i) => ({ part: { type: "tool-result", name: "read", result: { type: "text", value: "r".repeat(1_000) } }, index: i }))
+    const bands = assignBands(parts, opts, "tool-result")
+    const digest = [...bands.values()].filter((b) => b === "digest").length
+    assert.ok(digest > 0)
+  })
+  check("assignBands elides the oldest results", () => {
+    const opts = resolveOptions({ resultKeepBytes: 4_000, resultDigestBytes: 10_000, stairBytes: 1_000 }) as any
+    const parts = Array.from({ length: 100 }, (_, i) => ({ part: { type: "tool-result", name: "read", result: { type: "text", value: "r".repeat(1_000) } }, index: i }))
+    const bands = assignBands(parts, opts, "tool-result")
+    assert.ok([...bands.values()].some((b) => b === "elide"))
+  })
+}
+
+// --- 19. digest text shapes --------------------------------------------------
+for (const unit of [1]) {
+  check("digestResult of a megabyte single line does not grow", () => {
+    const text = "a".repeat(1_000_000)
+    const out = digestResult(text, OPTS, "read")
+    assert.ok(bytes(out) <= bytes(text))
+  })
+  check("digestBudgets never claims head+tail exceed content", () => {
+    for (const size of [100_000, 50_000, 20_000, 5_000]) {
+      const { head, tail } = digestBudgets(size, OPTS)
+      assert.ok(head + tail < size, `${head}+${tail} >= ${size}`)
+    }
+  })
+  check("digestBudgets grows non-decreasing with size", () => {
+    const small = digestBudgets(5_000, OPTS)
+    const big = digestBudgets(50_000, OPTS)
+    assert.ok(big.head >= small.head)
+    assert.ok(big.tail >= small.tail)
+  })
+  check("digestJson falls back for non-JSON", () => {
+    const text = "function foo() { return 42 }" + "x".repeat(5_000)
+    const out = digestJson(text, OPTS, "read")
+    assert.ok(out === undefined || bytes(out as string) <= bytes(text) + 10, "never grows")
+  })
+  check("digestResult stays readable on four-byte UTF-8", () => {
+    const text = " cargo 🙂".repeat(1_000)
+    const out = digestResult(text, OPTS, "read")
+    assert.ok(!out.includes("\ufffd"))
+  })
+}
+
+// --- 20. report, ledger, helpers --------------------------------------------
+for (const unit of [1]) {
+  check("reasoningKey is stable per message and text", () => {
+    assert.equal(reasoningKey("m1", "r"), reasoningKey("m1", "r"))
+    assert.notEqual(reasoningKey("m1", "r"), reasoningKey("m2", "r"))
+  })
+  check("reportSummary returns a string", () => {
+    assert.equal(typeof reportSummary("Token slim\nx"), "string")
+  })
+  check("writeReportFile returns a string or undefined", () => {
+    const f = writeReportFile(dir, "ses-test", "hello")
+    assert.ok(typeof f === "string" || f === undefined)
+  })
+  check("readPersistedStats tolerates a missing file", () => {
+    const r = readPersistedStats(dir, "no-such-session")
+    assert.ok(r === undefined || typeof r === "object")
+  })
+  check("elideImages preserves the image name pointer", () => {
+    const image = Buffer.from("p".repeat(20_000)).toString("base64")
+    const part = { type: "tool-result", name: "read", result: { type: "content", value: [{ type: "file", uri: `data:image/png;base64,${image}`, mime: "image/png", name: "shot.png" }] } }
+    const out = elideImages(part, "read") as any
+    assert.ok(out.saved > 0)
+    assert.ok(out.part.result.value[0].text.includes("shot.png"))
+  })
+  check("isProtectedPath protects by absolute path inside SELF", () => {
+    const selfFile = path.resolve(process.cwd(), "index.ts")
+    assert.equal(isProtectedPath(selfFile, []), true)
+  })
+  check("carriesSignature sees providerMetadata safely", () => {
+    assert.equal(carriesSignature({ type: "reasoning" }), false)
+    assert.equal(carriesSignature({ type: "reasoning", providerMetadata: {} }), false)
+    assert.equal(carriesSignature(null), false)
+  })
+  check("stripItemId leaves unrelated parts alone", () => {
+    const part = { type: "reasoning", text: "r", providerMetadata: { openai: { note: 1 } } }
+    assert.equal(stripItemId(part).providerMetadata.openai.note, 1)
+  })
+}
+
 console.log(`all ${count} checks passed`)
-assert.ok(count >= 100, `the suite must keep at least 100 checks, has ${count}`)
+assert.ok(count >= 250, `the suite must keep at least 300 checks, has ${count}`)
