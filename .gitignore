@@ -2,6 +2,10 @@ node_modules/
 *.bak
 *.log
 
+# Never commit a registry token. `.npmrc` in this directory would be picked up
+# by `npm publish` and would carry the token into the repo.
+.npmrc
+
 # If `directory` or `statsDirectory` is pointed at the checkout, the cache
 # files must not be committed.
 slim-output/
