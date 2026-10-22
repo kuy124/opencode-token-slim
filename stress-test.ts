@@ -35,6 +35,7 @@ import plugin, {
   flattenParts,
   floorForKind,
   isProtectedPath,
+  matchesPattern,
   isCacheMarker,
   markerPath,
   partCost,
@@ -48,6 +49,10 @@ import plugin, {
   stairForKind,
   stripItemId,
   trimCallInput,
+  trimText,
+  elideContentItems,
+  enforceDiskCap,
+  planRestores,
   takeBytes,
   takeTail,
   extractPath,
@@ -917,5 +922,97 @@ for (const unit of [1]) {
   })
 }
 
+// --- 21. disk cap eviction ----------------------------------------------------
+for (const unit of [1]) {
+  check("enforceDiskCap never crashes on a missing directory", () => {
+    assert.doesNotThrow(() => enforceDiskCap("Z:/does/not/exist", 100))
+  })
+  check("enforceDiskCap never crashes when nothing to delete", () => {
+    const d = mkdtempSync(path.join(os.tmpdir(), "slim-cap2-"))
+    writeFileSync(path.join(d, "small.txt"), "x")
+    assert.doesNotThrow(() => enforceDiskCap(d, 1024 * 1024))
+  })
+}
+
+// --- 22. content elision collapses text items --------------------------------
+for (const unit of [1]) {
+  check("elideContentItems leaves non-text items alone", () => {
+    const image = { type: "file", uri: "data: image/png" }
+    const out = elideContentItems([image] as any, "DIGEST")
+    assert.equal(out.value.length, 1, "only text items are affected")
+    assert.equal((out.value as any)[0].type, "file")
+  })
+  check("elideContentItems collapses repeated text into one marker", () => {
+    const big = "x".repeat(400)
+    const out = elideContentItems([{ type: "text", text: big }, { type: "text", text: big }] as any, "DIGEST")
+    const texts = (out.value as any[]).filter((i) => i.type === "text")
+    assert.equal(texts.length, 1, "only one marker survives")
+    assert.equal(texts[0].text, "DIGEST")
+  })
+  check("elideContentItems saves positive bytes", () => {
+    const out = elideContentItems([{ type: "text", text: "y".repeat(100) }] as any, "DIGEST")
+    assert.ok(out.saved > 0)
+  })
+  check("elideContentItems returns a copy", () => {
+    const input = [{ type: "text", text: "y" }]
+    const out = elideContentItems(input as any, "DIGEST")
+    assert.notEqual(out.value, input)
+  })
+}
+
+// --- 23. restore planning ---------------------------------------------------
+for (const unit of [1]) {
+  check("planRestores refuses outside-cache marker", () => {
+    const file = path.join(os.tmpdir(), "foreign.txt")
+    const text = `[slim: read result, 1 KB, elided - Full text: ${file}]`
+    const part = { type: "tool-result", name: "read", result: { type: "text", value: text } }
+    const flat = [{ part }]
+    const bands = new Map<any, any>(); bands.set(part, "keep")
+    const rests = planRestores(flat, bands as any, OPTS)
+    assert.equal(rests.get(part), undefined)
+  })
+  check("planRestores refuses a marker that is too big", () => {
+    const big = "v".repeat(OPTS.resultKeepBytes + 1000)
+    const out = digestResult(big, OPTS, "read")
+    const part = { type: "tool-result", name: "read", result: { type: "text", value: out } }
+    const flat = [{ part }]
+    const bands = new Map<any, any>(); bands.set(part, "keep")
+    const rests = planRestores(flat, bands as any, OPTS)
+    assert.equal(rests.get(part), undefined)
+  })
+  check("planRestores keeps an elide-band part out", () => {
+    const text = "r".repeat(Math.min(600, OPTS.resultKeepBytes - 100))
+    const out = digestResult(text, OPTS, "read")
+    const part = { type: "tool-result", name: "read", result: { type: "text", value: out } }
+    const flat = [{ part }]
+    const bands = new Map<any, any>(); bands.set(part, "elide")
+    const rests = planRestores(flat, bands as any, OPTS)
+    assert.equal(rests.get(part), undefined)
+  })
+  check("planRestores returns a map", () => {
+    assert.ok(planRestores([], new Map(), OPTS) instanceof Map)
+  })
+}
+
+// --- 24. transforms ---------------------------------------------------------
+for (const unit of [1]) {
+  check("trimText shorter than budget returns unchanged", () => assert.equal(trimText("short", 100), "short"))
+  check("trimText budget fits the output", () => assert.ok(bytes(trimText("x".repeat(100), 50)) <= 50))
+  check("quantize step 0 is identity", () => assert.equal(quantize(1234, 0), 1234))
+  check("quantize step 1 is identity", () => assert.equal(quantize(1234, 1), 1234))
+  check("quantize exact multiple passes", () => assert.equal(quantize(48_000, 16_000), 48_000))
+  check("isCacheMarker says yes for a cache file", () => {
+    const text = "x".repeat(2_000)
+    const out = digestResult(text, OPTS, "read")
+    assert.equal(isCacheMarker(out, OPTS), true)
+  })
+  check("isCacheMarker says no for a foreign path", () => {
+    assert.equal(isCacheMarker("[slim: read result, 1 KB, elided - Full text: /etc/passwd]", OPTS), false)
+  })
+  check("matchesPattern selects a glob", () => assert.equal(matchesPattern("src/foo.ts", "src/*.ts"), true))
+  check("matchesPattern nested glob", () => assert.equal(matchesPattern("a/b/c.txt", "a/**/*.txt"), true))
+  check("matchesPattern bare wildcard matches", () => assert.equal(matchesPattern("foo.ts", "*.ts"), true))
+}
+
 console.log(`all ${count} checks passed`)
-assert.ok(count >= 250, `the suite must keep at least 300 checks, has ${count}`)
+assert.ok(count >= 250, `the suite must keep at least 250 checks, has ${count}`)
