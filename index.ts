@@ -489,6 +489,17 @@ export function extractCallPath(input: any): string | undefined {
   return undefined
 }
 
+/** A deliberate cache read must reach the model, not become another digest. */
+function isRecoveryPath(candidate: string | undefined, directory: string): boolean {
+  if (!candidate) return false
+  try {
+    const relative = path.relative(fs.realpathSync(directory), fs.realpathSync(candidate))
+    return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+  } catch {
+    return false
+  }
+}
+
 // ---------------------------------------------------------------------------
 // snip — filter shell output before it ever becomes a tool result
 // ---------------------------------------------------------------------------
@@ -2069,17 +2080,26 @@ export default {
 
         if (text && size > opts.resultBytes) {
           const sourcePath = extractPath(text)
-          if (sourcePath && isProtectedPath(sourcePath, opts.protectPaths)) {
+          const callPath = extractCallPath(event.input)
+          if (
+            (sourcePath && isProtectedPath(sourcePath, opts.protectPaths)) ||
+            (callPath && isProtectedPath(callPath, opts.protectPaths)) ||
+            isRecoveryPath(sourcePath, opts.directory) ||
+            isRecoveryPath(callPath, opts.directory)
+          ) {
             ledger.bump({ protectedSkipped: 1 })
           } else {
             // Same tool, same content, already seen this session.
             const key = createHash("sha1").update(text).digest("hex")
             const bucket = ledger.seenFor(event.tool)
             if (size >= opts.duplicateBytes && bucket.has(key)) {
-              const trimmed = `[slim: duplicate ${event.tool} result (${size} bytes, identical to an earlier result in this session).]`
-              ledger.bump({ duplicatesCollapsed: 1, duplicateBytesDropped: size - bytes(trimmed) })
-              ledger.bumpTool(event.tool, size - bytes(trimmed))
+              // The earlier copy may have been trimmed or compacted away.
+              // Keep a recoverable pointer, or a digest when persistence is off.
+              const trimmed = elideToPointer(text, opts, event.tool, size)?.replace("[slim: ", "[slim: duplicate ") ??
+                `[slim: duplicate ${event.tool} result.]\n${digestJson(text, opts, event.tool) ?? digestResult(text, opts, event.tool)}`
               const elided = elideContentItems(content, trimmed)
+              ledger.bump({ duplicatesCollapsed: 1, duplicateBytesDropped: elided.saved })
+              ledger.bumpTool(event.tool, elided.saved)
               next = elided.value
               changed = true
             } else {
@@ -2256,7 +2276,7 @@ export default {
       // in the kept region while the marker in the database still says
       // "elided" — so the marker is undone too, from the full text on disk.
       const restores = planRestores(flat, bands, opts)
-      // Files this request still points at: the disk cap evicts them last.
+      // Files this request still points at must survive disk-cap eviction.
       const referenced = new Set<string>()
 
       const ids: string[] = []

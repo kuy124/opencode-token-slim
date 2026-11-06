@@ -7,8 +7,10 @@
  * reports numbers that match what the plugin did.
  */
 import assert from "node:assert/strict"
-import { readFileSync } from "node:fs"
-import plugin, { BRIEF as BRIEF_TEXT } from "./index.ts"
+import { mkdtempSync, readFileSync, rmSync } from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import plugin, { BRIEF as BRIEF_TEXT, markerPath } from "./index.ts"
 
 const BRIEF_SIZE = Buffer.byteLength(BRIEF_TEXT, "utf8")
 
@@ -97,6 +99,42 @@ function mockCtx(options: any = {}) {
 const bigResult = (n: number) => "x".repeat(n)
 
 async function run() {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "slim-recovery-"))
+  const recovery = mockCtx({ directory, snip: false })
+  const dispose = await (plugin as any).setup(recovery.ctx)
+  try {
+    const full = "recoverable output\n".repeat(5_000)
+    const makeResult = (input = {}) => ({
+      sessionID: "ses_recovery", tool: "read", status: "completed", input,
+      result: { content: [{ type: "text", text: full }] },
+    })
+    const first = makeResult()
+    const second = makeResult()
+    await recovery.hooks["tool.execute.after"](first)
+    await recovery.hooks["tool.execute.after"](second)
+    const file = markerPath(second.result.content[0].text)!
+    assert.ok(file, "duplicates retain a recovery pointer")
+    assert.equal(readFileSync(file, "utf8"), full)
+    assert.equal(markerPath(first.result.content[0].text), file)
+    const reread = makeResult({ path: file })
+    await recovery.hooks["tool.execute.after"](reread)
+    assert.equal(reread.result.content[0].text, full, "explicit cache reads are never re-digested")
+    const headerRead = makeResult()
+    headerRead.result.content[0].text = `Read file ${file}, lines 1-5000\n${full}`
+    const original = headerRead.result.content[0].text
+    await recovery.hooks["tool.execute.after"](headerRead)
+    assert.equal(headerRead.result.content[0].text, original, "cache reads identified by headers are preserved")
+    const protectedRead = makeResult({ path: path.resolve("index.ts") })
+    await recovery.hooks["tool.execute.after"](protectedRead)
+    assert.equal(protectedRead.result.content[0].text, full, "tool arguments honor source protection")
+    // A missing destination must not make an unrelated result exempt.
+    const missingRead = makeResult({ path: path.join(directory, "missing.txt") })
+    await recovery.hooks["tool.execute.after"](missingRead)
+    assert.notEqual(missingRead.result.content[0].text, full)
+  } finally {
+    dispose?.()
+    rmSync(directory, { recursive: true, force: true })
+  }
   const { ctx, hooks, commands, synthetic } = mockCtx({ keepFullOutput: false })
   await (plugin as any).setup(ctx)
 
@@ -129,6 +167,7 @@ async function run() {
   }
   await hooks["tool.execute.after"](second)
   assert.ok(second.result.content[0].text.includes("duplicate"), "a repeated result must be collapsed")
+  assert.ok(second.result.content[0].text.includes("x".repeat(100)), "without persistence duplicates still retain a usable digest")
 
   // --- A request goes out with a history that holds the big result. ---------
   const historyPart = { type: "tool-result", id: "prt_big", name: "read", result: { type: "text", value: bigResult(50_000) } }
