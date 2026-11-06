@@ -20,7 +20,7 @@
  */
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import plugin, {
@@ -603,7 +603,10 @@ check("different text writes a different file name", () => {
       id: `m${i}`,
       content: [
         { type: "reasoning", text: "r".repeat(600) },
-        { type: "tool-call", id: `c${i}`, name: "write", input: { content: "w".repeat(4_000) } },
+        // `read`, not `write`: writes are never trimmed (the model edits
+        // FROM old write args), so a history of raw writes is unbounded by
+        // design and would fail a never-grows check.
+        { type: "tool-call", id: `c${i}`, name: "read", input: { pattern: "w".repeat(4_000) } },
         { type: "tool-result", id: `c${i}`, name: "read", result: { type: "text", value: "y".repeat(4_000) } },
         { type: "text", text: "done" },
       ],
@@ -931,6 +934,84 @@ for (const unit of [1]) {
 
 // --- 21. disk cap eviction ----------------------------------------------------
 for (const unit of [1]) {
+  check("disk cap retains active references and evicts them once released", () => {
+    const d = mkdtempSync(path.join(os.tmpdir(), "slim-cap-held-"))
+    const held = path.join(d, "held.txt")
+    const unused = path.join(d, "unused.txt")
+    const now = Date.now
+    try {
+      writeFileSync(held, "active output")
+      writeFileSync(unused, "unused output")
+      enforceDiskCap(d, 1, new Set([path.relative(process.cwd(), held)]))
+      assert.equal(existsSync(held), true, "active output survives even above the cap")
+      assert.equal(existsSync(unused), false, "unused output is evicted")
+      Date.now = () => now() + 60_001
+      enforceDiskCap(d, 1)
+      assert.equal(existsSync(held), false, "released output is eligible next scan")
+    } finally {
+      Date.now = now
+      rmSync(d, { recursive: true, force: true })
+    }
+  })
+  check("disk cap throttles each directory independently", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "slim-cap-dirs-"))
+    try {
+      for (const name of ["a", "b"]) {
+        const d = path.join(root, name)
+        mkdirSync(d)
+        const file = path.join(d, "output.txt")
+        writeFileSync(file, "too big")
+        enforceDiskCap(d, 1)
+        assert.equal(existsSync(file), false, `${name} receives its own scan`)
+        writeFileSync(file, "new output")
+        enforceDiskCap(path.join(d, "."), 1)
+        assert.equal(existsSync(file), true, "repeat scans remain throttled")
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+  check("marker paths round-trip spaces and brackets and restore the original", () => {
+    const d = mkdtempSync(path.join(os.tmpdir(), "slim cache [quoted]-"))
+    const opts = resolveOptions({ directory: d, resultKeepBytes: 100_000 })
+    const full = "original output\n".repeat(2_000)
+    try {
+      const pointer = elideToPointer(full, opts, "read", bytes(full))!
+      const file = markerPath(pointer)!
+      assert.equal(path.dirname(file), d)
+      assert.equal(readFileSync(file, "utf8"), full)
+      assert.equal(isCacheMarker(pointer, opts), true)
+      assert.equal(readRestorable(pointer, opts), full)
+      const digest = digestResult(full, opts, "read")!
+      assert.equal(markerPath(digest), file)
+      assert.equal(readRestorable(digest, opts), full)
+      assert.equal(markerPath(elideToPointer(digest, opts, "read", bytes(digest))!), file)
+      const legacy = `[slim: read result. Full text: ${path.join(os.tmpdir(), "Jane Doe", "output.txt")}]`
+      assert.equal(markerPath(legacy), path.join(os.tmpdir(), "Jane Doe", "output.txt"))
+    } finally {
+      rmSync(d, { recursive: true, force: true })
+    }
+  })
+  check("restore refuses symlinks escaping the cache but allows a linked cache root", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "slim-links-"))
+    const cache = path.join(root, "cache")
+    const outside = path.join(root, "outside")
+    const alias = path.join(root, "alias")
+    try {
+      mkdirSync(cache)
+      mkdirSync(outside)
+      writeFileSync(path.join(outside, "secret.txt"), "outside secret")
+      symlinkSync(outside, path.join(cache, "escape"), "junction")
+      const marker = `[slim: read result. Full text: ${path.join(cache, "escape", "secret.txt")}]`
+      assert.equal(readRestorable(marker, resolveOptions({ directory: cache })), undefined)
+      symlinkSync(cache, alias, "junction")
+      const opts = resolveOptions({ directory: alias })
+      const pointer = elideToPointer("safe output", opts, "read", 11)!
+      assert.equal(readRestorable(pointer, opts), "safe output")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
   check("enforceDiskCap never crashes on a missing directory", () => {
     assert.doesNotThrow(() => enforceDiskCap("Z:/does/not/exist", 100))
   })

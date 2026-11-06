@@ -127,15 +127,16 @@ const eventWith = (providerID: string) => ({
 }
 
 {
-  // The default is off: nothing is touched unless a provider is listed.
+  // AgentRouter is stripped by default because it load-balances across
+  // Azure OpenAI resources; other providers are left alone unless listed.
   const { ctx, hooks } = mockCtx({})
   await (plugin as any).setup(ctx)
   const event = eventWith("agentrouter")
   await hooks["session.context"](event)
   assert.equal(
     event.messages[0].content[0].providerMetadata.openai.itemId,
-    "rs_1",
-    "without configuration the ids must stay",
+    undefined,
+    "agentrouter ids are stripped by default",
   )
 }
 

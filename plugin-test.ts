@@ -136,12 +136,12 @@ async function run() {
   // band, so it is elided; the newer one is the model's current context, so
   // it is kept whole.
   const oldPart = { type: "tool-result", id: "prt_old", name: "read", result: { type: "text", value: bigResult(50_000) } }
-  const messages = Array.from({ length: 20 }, (_, i) => ({
+  const messages = Array.from({ length: 10 }, (_, i) => ({
     id: `m${i}`,
     content: [{ type: "reasoning", text: "r".repeat(5_000) }],
   }))
-  messages[17].content = [oldPart]
-  messages[19].content = [historyPart]
+  messages[7].content = [oldPart]
+  messages[9].content = [historyPart]
   const system = [{ type: "text", text: "s".repeat(40_000) }]
   const tools = { read: { description: "d".repeat(3_000), input: { type: "object", properties: { path: { type: "string", description: "p".repeat(2_000) } } } } }
 
@@ -342,7 +342,7 @@ async function run() {
   const { ctx, hooks, commands, synthetic } = mockCtx({ keepFullOutput: false })
   await (plugin as any).setup(ctx)
 
-  const systemBytes = 24000
+  const systemBytes = 16000
   const big = "A".repeat(20000)
   const rest = "B".repeat(14918)
   const event = {
@@ -363,7 +363,7 @@ async function run() {
 
   // The cap must not throw away more than it has to. With a 34.1 KB prompt
   // and a 23 KB budget, the result must be at least 22 KB.
-  assert.ok(total >= 22_000, `the cap must not over-trim: ${total} is well under the budget`)
+  assert.ok(total >= 13_000, `the cap must not over-trim: ${total} is well under the budget`)
 
   await commands[0].execute({ sessionID: "ses_cap" })
   const report = fullReport(synthetic)

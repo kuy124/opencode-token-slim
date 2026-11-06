@@ -221,6 +221,40 @@ const reasoningCount = (messages) =>
 // The trimmer applied the same number again as a per-call ceiling, so every
 // call under 8 KB was left whole: a session with two thousand 7 KB calls
 // replayed all 14 MB of them, and the plugin reported them as "kept".
+//
+// `write`/`edit` calls are exempt — the model edits FROM old write args, and
+// a trimmed write is what gets copied back into the file — so this uses
+// `read` calls, which trim because their results can be re-read from disk.
+{
+  const { ctx, hooks } = mockCtx()
+  await plugin.setup(ctx)
+
+  const messages = Array.from({ length: 200 }, (_, i) => ({
+    id: `m${i}`,
+    content: [
+      { type: "tool-call", name: "read", input: { path: `f${i}.txt`, pattern: "w".repeat(7_000) } },
+      { type: "tool-result", name: "read", result: { type: "text", value: "ok" } },
+    ],
+  }))
+  const before = messages.reduce((n, m) => n + bytes(JSON.stringify(m.content)), 0)
+  const event = await runContext(ctx, hooks, "regress4", messages)
+  const after = event.messages.reduce((n, m) => n + bytes(JSON.stringify(m.content)), 0)
+  assert.ok(after < before / 2, `most of the call arguments must go: ${after} !< ${before / 2}`)
+
+  // The call itself survives, with its shape.
+  const old = event.messages[50].content[0]
+  assert.equal(old.name, "read", "the call must survive")
+  assert.equal(typeof old.input.path, "string", "the call must keep its shape")
+
+  // The newest call is the model's current context, so it is kept whole.
+  const newest = event.messages.at(-1).content[0]
+  assert.equal(bytes(newest.input.pattern), 7_000, "the newest call is kept whole")
+}
+
+// --- BUG 4b: write/edit calls are never trimmed, even when old --------------
+//
+// The model edits FROM old write arguments: an old write trimmed to a marker
+// is what gets copied back into the file. Savings come from reads instead.
 {
   const { ctx, hooks } = mockCtx()
   await plugin.setup(ctx)
@@ -232,19 +266,11 @@ const reasoningCount = (messages) =>
       { type: "tool-result", name: "write", result: { type: "text", value: "ok" } },
     ],
   }))
-  const before = messages.reduce((n, m) => n + bytes(JSON.stringify(m.content)), 0)
-  const event = await runContext(ctx, hooks, "regress4", messages)
-  const after = event.messages.reduce((n, m) => n + bytes(JSON.stringify(m.content)), 0)
-  assert.ok(after < before / 2, `most of the call arguments must go: ${after} !< ${before / 2}`)
+  const event = await runContext(ctx, hooks, "regress4b", messages)
 
-  // The call itself survives, with its shape.
   const old = event.messages[50].content[0]
   assert.equal(old.name, "write", "the call must survive")
-  assert.equal(typeof old.input.path, "string", "the call must keep its shape")
-
-  // The newest call is the model's current context, so it is kept whole.
-  const newest = event.messages.at(-1).content[0]
-  assert.equal(bytes(newest.input.content), 7_000, "the newest call is kept whole")
+  assert.equal(bytes(old.input.content), 7_000, "an old write is kept whole")
 }
 
 // --- BUG 5: a result undo brings back into the kept region comes back whole --
@@ -387,10 +413,13 @@ const reasoningCount = (messages) =>
         {
           type: "tool-call",
           id: "c1",
-          name: "write",
-          input: { filePath: "F:/tmp/normal.ts", content: "y".repeat(60_000) },
+          // `read`, not `write`: writes are never trimmed (the model edits
+          // FROM old write args), so a writes-only history counts zero calls
+          // and this test would prove nothing.
+          name: "read",
+          input: { filePath: "F:/tmp/normal.ts", pattern: "y".repeat(60_000) },
         },
-        { type: "tool-result", id: "c1", name: "write", result: { type: "text", value: "ok" } },
+        { type: "tool-result", id: "c1", name: "read", result: { type: "text", value: "ok" } },
       ],
     },
     {

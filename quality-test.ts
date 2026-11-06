@@ -161,10 +161,13 @@ function build(nMessages: number, resultBytes: number) {
 
 // --- 5. a tool CALL's arguments are shortened, and keep their shape ----------
 //
-// A `write` carries the whole file in its arguments, so a session that writes
-// ten files replays all ten files on every turn forever. The call itself has
-// to survive — the model needs to know it made the call — and the shape of
-// the arguments has to survive too, or the call no longer means anything.
+// A `read` with a bulky selector replays that selector on every turn, so old
+// calls are shortened. The call itself has to survive — the model needs to
+// know it made the call — and the shape of the arguments has to survive too,
+// or the call no longer means anything.
+//
+// `write`/`edit` calls are the exception: the model edits FROM old write
+// arguments, so those are never trimmed (see BUG 4b in regress-test.mjs).
 {
   const { ctx, hooks } = mockCtx(OPTS)
   await (plugin as any).setup(ctx)
@@ -175,10 +178,10 @@ function build(nMessages: number, resultBytes: number) {
       {
         type: "tool-call",
         id: `c${i}`,
-        name: "write",
-        input: { path: `f${i}.txt`, content: "w".repeat(20_000) },
+        name: "read",
+        input: { path: `f${i}.txt`, pattern: "w".repeat(20_000) },
       },
-      { type: "tool-result", id: `c${i}`, name: "write", result: { type: "text", value: "ok" } },
+      { type: "tool-result", id: `c${i}`, name: "read", result: { type: "text", value: "ok" } },
     ],
   }))
   const event = {
@@ -194,8 +197,8 @@ function build(nMessages: number, resultBytes: number) {
     const call = m.content.find((p: any) => p.type === "tool-call")
     assert.ok(call, "every tool call must survive")
     assert.equal(typeof call.input.path, "string", "the path must survive")
-    assert.equal(typeof call.input.content, "string", "the content must survive as a string")
-    if (call.input.content.length < 20_000) trimmed++
+    assert.equal(typeof call.input.pattern, "string", "the pattern must survive as a string")
+    if (call.input.pattern.length < 20_000) trimmed++
   }
   assert.ok(trimmed > 0, "the old calls must have their arguments shortened")
 }

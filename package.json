@@ -54,6 +54,7 @@
     "bench": "node --experimental-strip-types bench.ts",
     "consistency": "node --experimental-strip-types consistency.ts",
     "quality-live": "node --experimental-strip-types quality-live.ts",
-    "prepublishOnly": "npm test"
+    "prepublishOnly": "npm test",
+    "test:real": "node real-model-test.mjs"
   }
 }

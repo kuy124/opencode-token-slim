@@ -11,7 +11,7 @@
  * cannot drift away from the shipped code.
  */
 import assert from "node:assert/strict"
-import { digestResult, type SlimOptions } from "./index.ts"
+import { digestResult, digestSignal, type SlimOptions } from "./index.ts"
 
 const bytes = (s: string) => Buffer.byteLength(s, "utf8")
 
@@ -125,6 +125,57 @@ assert.ok(!d3.includes("omitted"), "short result claims no omission")
 // 12. The digest must never be larger than the original.
 for (const sample of [oneBig, twoBig, twoSmall, text, lines.slice(0, 3).join("\n")]) {
   assert.ok(bytes(digest(sample)) <= bytes(sample), "digest never exceeds the original")
+}
+
+// ---------------------------------------------------------------------------
+// digestSignal: the summary keeps what the head-and-tail digest drops.
+// ---------------------------------------------------------------------------
+
+const goLog = [
+  "=== RUN   TestUserCreate",
+  ...Array.from({ length: 400 }, (_, i) => `    transport.go:${i}: dial tcp 10.0.0.${i}: i/o timeout`),
+  "--- FAIL: TestUserCreate (30.02s)",
+  "    user_test.go:88: expected 3 users, got 0",
+  "--- FAIL: TestOrderShip (0.01s)",
+  "    order_test.go:12: nil pointer dereference",
+  "FAIL\tgithub.com/x/y\t32.011s",
+  "ok  \tgithub.com/x/z\t0.002s",
+].join("\n")
+
+const sig = digestSignal(goLog, OPTS, "shell")
+assert.ok(sig, "signal digest fires on a failing test log")
+assert.equal(sig.match(/FAIL/g)?.length, 3, "every failure line survives")
+assert.ok(sig.includes("expected 3 users, got 0"), "the assertion message survives")
+assert.ok(!sig.includes("dial tcp 10.0.0.7"), "setup noise is dropped")
+assert.ok(bytes(sig) < bytes(digestResult(goLog, OPTS, "shell")), "beats the head-and-tail digest")
+assert.ok(bytes(sig) < bytes(goLog) / 4, "cuts the log to under a quarter")
+
+// A log with no signal lines must not be summarized: there is nothing to
+// point at, and the head-and-tail digest is a better answer.
+const quiet = Array.from({ length: 200 }, (_, i) => `step ${i}: ok`).join("\n")
+assert.equal(digestSignal(quiet, OPTS, "shell"), undefined, "no signal means no summary")
+
+// A log that is half failures is the information, not noise around it.
+const allFail = Array.from({ length: 100 }, (_, i) => `not ok ${i} - case ${i}`).join("\n")
+assert.equal(digestSignal(allFail, OPTS, "shell"), undefined, "dense failures are left intact")
+
+// tsc-style diagnostics count as signal.
+const tsc = [
+  ...Array.from({ length: 200 }, (_, i) => `  const item_${i} = ${i}`),
+  "src/a.ts:12:5 - error TS2322: Type 'string' is not assignable to type 'number'.",
+  "src/b.ts:40:1 - error TS1005: ';' expected.",
+].join("\n")
+const dtsc = digestSignal(tsc, OPTS, "shell")
+assert.ok(dtsc?.includes("TS2322"), "compiler errors survive")
+assert.ok(bytes(dtsc!) < bytes(tsc) / 4, "compiler log shrinks")
+
+// Small results are not worth summarizing at all.
+assert.equal(digestSignal("a\nb\nc", OPTS, "read"), undefined, "short text is left alone")
+
+// The summary must never be larger than what it replaces.
+for (const sample of [goLog, tsc, quiet, allFail]) {
+  const s = digestSignal(sample, OPTS, "shell")
+  if (s !== undefined) assert.ok(bytes(s) < bytes(sample), "signal digest is smaller")
 }
 
 console.log("all checks passed")

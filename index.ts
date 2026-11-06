@@ -121,7 +121,7 @@ export interface SlimOptions {
    * the model is about to act on is worth its bytes, and one from fifty turns
    * ago is not.
    */
-  resultKeepBytes: number
+  resultKeepBytes: number,
   /**
    * The band of tool results that get a digest rather than a pointer.
    *
@@ -177,8 +177,12 @@ export interface SlimOptions {
    * listed providers are affected; everything else is left alone.
    */
   stripItemIds: string[]
+  /** Automatically strip provider item ids for multi-resource gateways such as AgentRouter, even when not listed in stripItemIds. */
+  autoStripAgentRouter: boolean
   /** Write the full text next to the digest instead of dropping it. */
   keepFullOutput: boolean
+  /** Add provider cache_control markers to the cached prefix (Anthropic-style). Opt-in; off by default. */
+  cacheControl: boolean
   /** Where full outputs are written. */
   directory: string
   /** Master switch. */
@@ -228,10 +232,10 @@ export interface SlimOptions {
 }
 
 const DEFAULTS: SlimOptions = {
-  resultBytes: 12_000,
-  headBytes: 3_000,
-  tailBytes: 1_500,
-  // The budgets below are sized against a real session: 670 LLM messages,
+  resultBytes: 8_000,
+  headBytes: 2_000,
+  tailBytes: 1_000,
+  toolOutputBytes: 32_768,
   // 4.8 MB of payload, of which 2.3 MB was reasoning and 1.9 MB was tool
   // results. They are byte budgets, not message counts, so the saving does
   // not swing with the shape of the session.
@@ -239,20 +243,21 @@ const DEFAULTS: SlimOptions = {
   // They are also sized to hold 60% of the payload back at every session
   // length, not just the long ones. A budget that only bites in a long
   // session is the same bug as a message-count window, just smaller.
-  reasoningBytes: 80_000,
-  reasoningKeepBytes: 32_000,
+  reasoningBytes: 50_000,
+  reasoningKeepBytes: 16_000,
   stairBytes: 16_000,
-  resultKeepBytes: 32_000,
-  resultDigestBytes: 48_000,
-  callKeepBytes: 8_000,
-  textKeepBytes: 16_000,
-  elideFloorBytes: 512,
-  systemBytes: 24_000,
-  toolBytes: 10_000,
-  duplicateBytes: 2_000,
+  resultKeepBytes: 24_000,
+  resultDigestBytes: 24_000,
+  callKeepBytes: 4_000,
+  textKeepBytes: 8_000,
+  elideFloorBytes: 256,
+  systemBytes: 16_000,
+  toolBytes: 8_000,
+  duplicateBytes: 1_000,
   stripItemIds: [],
+  autoStripAgentRouter: true,
   keepFullOutput: true,
-  directory: path.join(
+  cacheControl: false,  directory: path.join(
     process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"),
     "opencode",
     "slim-output",
@@ -300,8 +305,9 @@ export function resolveOptions(raw: Record<string, any> | undefined): SlimOption
     toolBytes: positive(o.toolBytes, DEFAULTS.toolBytes),
     duplicateBytes: positive(o.duplicateBytes, DEFAULTS.duplicateBytes),
     stripItemIds: Array.isArray(o.stripItemIds) ? o.stripItemIds.filter((v: any) => typeof v === "string") : [],
+    autoStripAgentRouter: o.autoStripAgentRouter !== false,
     keepFullOutput: o.keepFullOutput !== false,
-    directory: typeof o.directory === "string" && o.directory ? o.directory : DEFAULTS.directory,
+    cacheControl: o.cacheControl === true,    directory: typeof o.directory === "string" && o.directory ? o.directory : DEFAULTS.directory,
     enabled: o.enabled !== false,
     snip: o.snip !== false,
     snipPath: typeof o.snipPath === "string" ? o.snipPath : DEFAULTS.snipPath,
@@ -517,26 +523,76 @@ export function extractCallPath(input: any): string | undefined {
  * quoting has to match the shell.
  */
 export function repairSnipCommand(rewritten: string, snipPath: string, shell?: string): string {
-  // Split off snip's own path: quoted, or up to the first space.
-  let rest: string
-  if (rewritten.startsWith('"')) {
-    const end = rewritten.indexOf('"', 1)
-    if (end < 0) return rewritten
-    rest = rewritten.slice(end + 1)
-  } else {
-    const space = rewritten.indexOf(" ")
-    if (space < 0) return rewritten
-    rest = rewritten.slice(space)
-  }
+  // snip answers with the path of its own binary leading the command:
+  // `"C:\Users\me\go\bin\snip.exe" run -- git log`. For a multi-command line
+  // snip repeats that binary path on EVERY segment:
+  // `"C:\...\snip.exe" run -- git a ; "C:\...\snip.exe" run -- git b`.
+  // Every leading path has to be repaired: fixing only the first leaves a bare
+  // quoted path mid-line, and PowerShell rejects it ("Unexpected token").
+  // Only segment heads are touched, never arguments: a grep pattern like
+  // `"snip"` must survive verbatim.
   const bin = snipPath || "snip"
-  if (!/\s/.test(bin)) return `${bin}${rest}`
-  // An explicit path with spaces has to be quoted, and only PowerShell needs
-  // the call operator to run a quoted path. cmd treats a leading `&` as a
-  // command separator and would run an empty command first, so it must not
-  // have one.
-  const quoted = `"${bin.replace(/\\/g, "/")}"`
+  const needsQuote = /\s/.test(bin)
+  // An explicitly configured path with spaces has to be quoted, and only
+  // PowerShell needs the call operator to run a quoted path. cmd treats a
+  // leading `&` as a command separator and would run an empty command first,
+  // so it must not have one. After `;` the same rule holds: a new statement
+  // still cannot start with a bare quoted path in PowerShell.
   const isPowerShell = shell === undefined || /powershell|pwsh/i.test(shell)
-  return isPowerShell ? `& ${quoted}${rest}` : `${quoted}${rest}`
+  const replacement = !needsQuote
+    ? bin
+    : isPowerShell
+      ? `& "${bin.replace(/\\/g, "/")}"`
+      : `"${bin.replace(/\\/g, "/")}"`
+  // Split on `;` outside quotes. `&&`/`||` need no split: snip joins segments
+  // with ` ; `.
+  // ponytail: `;`-split only; per-shell `&&`/`||` joining if snip ever emits it.
+  const segments: string[] = []
+  let current = ""
+  let quote: string | null = null
+  for (let i = 0; i < rewritten.length; i++) {
+    const ch = rewritten[i]
+    if (quote) {
+      current += ch
+      if (ch === "\\" && i + 1 < rewritten.length) current += rewritten[++i]
+      else if (ch === quote) quote = null
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+      current += ch
+    } else if (ch === ";") {
+      segments.push(current)
+      current = ""
+    } else {
+      current += ch
+    }
+  }
+  segments.push(current)
+  if (segments.length === 1 && !/;/.test(rewritten)) {
+    // Fast path: preserve the exact historical behaviour for one command.
+    return repairSegment(rewritten, replacement)
+  }
+  return segments.map((s) => repairSegment(s, replacement)).join(";")
+}
+
+/** Replace a snip binary path leading one `;`-segment, leaving the rest intact. */
+function repairSegment(segment: string, replacement: string): string {
+  const indent = segment.match(/^\s*/)?.[0] ?? ""
+  const body = segment.slice(indent.length)
+  let rest: string | null = null
+  if (body.startsWith('"')) {
+    // Quoted head: only a token naming snip is replaced, never an argument
+    // like the grep pattern `"snip"`.
+    const end = body.indexOf('"', 1)
+    if (end >= 0 && /snip(\.exe)?$/i.test(body.slice(1, end).replace(/\\+$/, ""))) {
+      rest = body.slice(end + 1)
+    }
+  } else {
+    const space = body.search(/\s/)
+    const head = space < 0 ? body : body.slice(0, space)
+    if (/snip(\.exe)?$/i.test(head)) rest = space < 0 ? "" : body.slice(space)
+  }
+  if (rest === null) return segment
+  return `${indent}${replacement}${rest}`
 }
 
 /**
@@ -695,7 +751,15 @@ export const BRIEF = [
   "  The result is not missing anything you need, and it is not a partial failure.",
   "- Do not re-run a command to recover output you already have.",
   "",
-  "### Elided context",
+  "### Output discipline (saves tokens in your own output)",
+  "",
+  "- Reason first, but commit a conclusion, not a narration of the reasoning.",
+  "- Never open a turn with \"Let me\", \"I'll\", \"Let's\", or \"Sure\".",
+  "- No \"um\", \"hmm\", \"I think maybe\", hedging or filler: say yes, no, or state the unknown.",
+  "- The diff is the deliverable: in edit sessions the changed file is the output, not a tour of it.",
+  "- Critique a choice in one line (what's wrong; what's right), never a paragraph.",
+  "",
+
   "",
   "Old parts of this conversation are shortened to save tokens. Every one of them says what it is:",
   "",
@@ -771,6 +835,11 @@ interface Stats {
   snipCommands: number
   /** Results left alone because their path or tool is protected. */
   protectedSkipped: number
+  /** Hash of this request's trimmed payload, for detecting cache busts. */
+  prevPrefixHash: string
+  /** Times the trimmed payload differed from the previous one in a way that
+   *  will invalidate the provider's prompt cache. */
+  cacheBusts: number
   /** Bytes saved by tool, so the report can name the expensive one. */
   byTool: Record<string, number>
 }
@@ -800,12 +869,29 @@ function emptyStats(): Stats {
     snipBytesFiltered: 0,
     snipCommands: 0,
     protectedSkipped: 0,
+    prevPrefixHash: "",
+    cacheBusts: 0,
     byTool: {},
   }
 }
 
 /** Bytes kept from the start of a long string inside an old tool call. */
 const CALL_ARG_KEEP = 200
+
+/** Strings at or under this survive in an OLD call: a path, a pattern, a command. */
+const CALL_OLD_KEEP = 96
+
+/**
+ * Tools whose call arguments are never trimmed.
+ *
+ * A `write` (or `edit`) carries file content in its arguments, and the model
+ * edits FROM those arguments on later turns. Trimming an old write to a
+ * head-only marker leaves the marker as the surviving "content", and that
+ * marker is what gets copied back into the file. Reads stay trimmed (a read
+ * result can be re-read from disk); writes never are.
+ */
+// ponytail: fixed set, a config knob if tool names ever vary per host
+const CALL_KEEP_WHOLE = new Set(["write", "edit", "apply_patch"])
 
 /** A trim this small is not worth the marker that explains it. */
 const CALL_TRIM_MIN = 128
@@ -828,7 +914,7 @@ const CALL_TRIM_MIN = 128
  * budget on its own and was left whole, so two thousand sub-budget calls
  * replayed in full. A budget is a total, not a per-part ceiling.
  */
-export function trimCallInput(input: any): { input: any; changed: boolean; saved: number } {
+export function trimCallInput(input: any, aggressive = false): { input: any; changed: boolean; saved: number } {
   if (!input || typeof input !== "object") return { input, changed: false, saved: 0 }
   let saved = 0
   const walk = (value: any, depth: number): any => {
@@ -837,11 +923,17 @@ export function trimCallInput(input: any): { input: any; changed: boolean; saved
     // content); raise the cap if a tool ever nests deeper.
     if (depth > 6) return value
     if (typeof value === "string") {
-      if (bytes(value) <= CALL_ARG_KEEP) return value
-      const kept = takeBytes(value, CALL_ARG_KEEP)
-      // The marker is paid for out of the saving, so the number reported is
-      // the number of bytes the payload actually lost.
-      const next = `${kept}\n[slim: ${fmt(bytes(value) - bytes(kept))} of this argument elided]`
+      // An old call is mostly old news: the file it wrote exists, the command
+      // it ran printed its output, and the result part right next to it says
+      // so. Still, keep a short head so the model can tell what the call was
+      // about (a command, a path, a pattern); a bare size marker is useless.
+      // The keep is small on purpose: 96 bytes (CALL_OLD_KEEP).
+      if (bytes(value) <= (aggressive ? CALL_OLD_KEEP : CALL_ARG_KEEP)) return value
+      const next = aggressive
+        ? `${takeBytes(value, CALL_OLD_KEEP)}\n[slim: ${fmt(bytes(value) - CALL_OLD_KEEP)} of this argument elided]`
+        : `${takeBytes(value, CALL_ARG_KEEP)}\n[slim: ${fmt(bytes(value) - CALL_ARG_KEEP)} of this argument elided]`
+      // Never trade a string for a marker that costs more than it.
+      if (bytes(next) >= bytes(value)) return value
       saved += bytes(value) - bytes(next)
       return next
     }
@@ -854,7 +946,12 @@ export function trimCallInput(input: any): { input: any; changed: boolean; saved
     return value
   }
   const next = walk(input, 0)
-  if (saved < CALL_TRIM_MIN) return { input, changed: false, saved: 0 }
+  // The 128-byte gate is a middle-band rule: a tiny trim costs more in marker
+  // than it saves. On the old band, a small saving across hundreds of these
+  // calls still adds up, so the gate drops to 32, enough for one marker's worth
+  // of actual shrinkage rather than one big one.
+  const minSaved = aggressive ? 32 : CALL_TRIM_MIN
+  if (saved < minSaved) return { input, changed: false, saved: 0 }
   return { input: next, changed: true, saved }
 }
 
@@ -1285,13 +1382,15 @@ export function writeFullOutput(directory: string, name: string, text: string) {
  * readdir and stat. The cap is 256 MiB by default; a minute of drift costs
  * nothing.
  */
-let lastDiskScan = 0
+const lastDiskScan = new Map<string, number>()
 const DISK_SCAN_MS = 60_000
 
 export function enforceDiskCap(directory: string, maxBytes: number, keep?: Set<string>) {
+  directory = path.resolve(directory)
   const now = Date.now()
-  if (now - lastDiskScan < DISK_SCAN_MS) return
-  lastDiskScan = now
+  const last = lastDiskScan.get(directory)
+  if (last !== undefined && now - last < DISK_SCAN_MS) return
+  lastDiskScan.set(directory, now)
   let entries: fs.Dirent[]
   try {
     entries = fs.readdirSync(directory, { withFileTypes: true })
@@ -1312,13 +1411,13 @@ export function enforceDiskCap(directory: string, maxBytes: number, keep?: Set<s
     }
   }
   if (total <= maxBytes) return
-  // Oldest first, but a file the request still points at goes last: deleting
-  // it turns a digest into a dead end, and a dead end is data loss. The cap
-  // is still hard — if every file is referenced, the oldest go anyway.
-  const held = (f: { path: string }) => (keep?.has(f.path) ? 1 : 0)
-  files.sort((a, b) => held(a) - held(b) || a.mtime - b.mtime)
+  // Active references may exceed the cap: deleting one turns a digest into
+  // a dead end. Only unreferenced files are eligible, oldest first.
+  const held = new Set(Array.from(keep ?? [], (file) => path.resolve(file)))
+  files.sort((a, b) => a.mtime - b.mtime)
   for (const file of files) {
     if (total <= maxBytes) break
+    if (held.has(file.path)) continue
     try {
       fs.unlinkSync(file.path)
       total -= file.size
@@ -1358,10 +1457,10 @@ export function elideToPointer(
   const existing = markerPath(text)
   if (existing) {
     // The content is already a digest that points at the full text.
-    pointer = ` Full text: ${existing}`
+    pointer = ` Full text: ${formatMarkerPath(existing)}`
   } else if (opts.keepFullOutput) {
     const file = writeFullOutput(opts.directory, toolName, text)
-    if (file) pointer = ` Full text: ${file}`
+    if (file) pointer = ` Full text: ${formatMarkerPath(file)}`
   }
   // A pointer without a file is a pointer to nothing: the content is gone and
   // the model is told it is gone. That is worse than a digest, which at
@@ -1375,10 +1474,13 @@ export function elideToPointer(
  * The file a slim marker points at, if the text carries one.
  *
  * Both shapes are recognised: a head+tail digest (`Full output:`) and a bare
- * pointer (`Full text:`). The path stops at whitespace and at the closing
- * bracket, so a pointer to a pointer cannot swallow the bracket and grow one
- * more `]` on every request.
+ * pointer (`Full text:`). Quote paths with whitespace or marker delimiters;
+ * keep accepting plain paths from older sessions.
  */
+function formatMarkerPath(file: string): string {
+  return /[\s\[\]"]/.test(file) ? JSON.stringify(file) : file
+}
+
 export function markerPath(text: string): string | undefined {
   // Not anchored: a digest puts its marker between the head and the tail, so
   // the path it names is the first marker in the value. A text that merely
@@ -1386,7 +1488,15 @@ export function markerPath(text: string): string | undefined {
   // therefore parses too — which is why every caller that acts on the path
   // checks it with `isCacheMarker` first. Anchoring here would be wrong: it
   // would stop every digest from being restorable.
-  return /\[slim:[^\]]*?Full (?:output|text): ([^\s\]]+)/.exec(text)?.[1]
+  const match = /\[slim:[^\]]*?Full (?:output|text): ("(?:\\.|[^"\\])*"|[^\]\r\n]+?)(?= Re-(?:read with offset\/limit|run with narrower output)|\])/.exec(text)
+  if (!match) return undefined
+  const value = match[1].trim()
+  if (!value.startsWith('"')) return value || undefined
+  try {
+    return JSON.parse(value) || undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -1424,8 +1534,8 @@ export function readRestorable(text: string, opts: SlimOptions): string | undefi
   const file = markerPath(text)
   if (!file) return undefined
   try {
-    const root = path.resolve(opts.directory)
-    const full = path.resolve(file)
+    const root = fs.realpathSync(opts.directory)
+    const full = fs.realpathSync(file)
     if (!full.startsWith(root + path.sep)) return undefined
     const stat = fs.statSync(full)
     if (!stat.isFile() || stat.size > opts.resultKeepBytes) return undefined
@@ -1634,7 +1744,7 @@ export function digestResult(text: string, opts: SlimOptions, toolName: string) 
   let pointer = ""
   if (opts.keepFullOutput) {
     const file = writeFullOutput(opts.directory, toolName, text)
-    if (file) pointer = ` Full output: ${file}`
+    if (file) pointer = ` Full output: ${formatMarkerPath(file)}`
   }
 
   let clipNote = ""
@@ -1658,6 +1768,115 @@ export function digestResult(text: string, opts: SlimOptions, toolName: string) 
   // digest can come out larger than the original, which would be a
   // regression, not a saving.
   return bytes(digest) < total ? digest : text
+}
+
+/**
+ * Lines that carry the answer out of a large result.
+ *
+ * A head-and-tail digest keeps the beginning and the end, and on a long log
+ * those are the two places the answer is NOT: a test runner prints setup at
+ * the top and a summary at the bottom, and the failing cases sit in the
+ * middle, exactly where they are dropped. A 900-line `go test` log becomes
+ * 4.5 KB of noise; the eleven lines that say what failed are 700 bytes.
+ *
+ * These patterns pick the lines that say something happened. The rest is what
+ * the model would skip if it could afford to read it, and the full text stays
+ * on disk for the turn that needs it.
+ */
+const SIGNAL_LINES: RegExp[] = [
+  /^\s*not ok\b/i, // TAP
+  /^\s*---\s*FAIL\b/, // go test
+  /^\s*(?:✗|✘|×|FAIL|FAILED|Failing)\b/i, // jest, vitest, pytest, mocha
+  /^\s*\d+ (?:failing|failed|passing)\b/i, // mocha summary
+  /^\S[^:]*:\d+(?::\d+)?\s*(?:-|:)?\s*(?:error|warning|note|fatal)\b/i, // tsc, eslint, gcc
+  /^\s*(?:error|fatal|panic|Traceback|Exception|AssertionError)\b/i,
+  /\b(?:tests?|assertions?) (?:passed|failed|ran)\b/i,
+]
+
+/**
+ * Replace a big result with the lines that matter plus a pointer to the rest.
+ *
+ * The rule only fires when the signal is SPARSE: if half the log is failures,
+ * the log is the information and cutting it down saves little for what it
+ * risks. The output is capped below the cost of the head-and-tail digest it
+ * replaces, so choosing it is never a regression.
+ */
+export function digestSignal(text: string, opts: SlimOptions, toolName: string) {
+  const total = bytes(text)
+  const lines = text.split("\n")
+  // Shorter than this and the head-and-tail digest is already the whole thing.
+  if (lines.length < 30) return undefined
+
+  const seen = new Set<string>()
+  const hits: string[] = []
+  // Counted over the whole log, not over what the cap keeps: a log that is
+  // half failures must be recognised as dense even though the cap stops the
+  // walk at a dozen lines.
+  let matched = 0
+  for (const line of lines) if (SIGNAL_LINES.some((rx) => rx.test(line))) matched++
+  if (matched === 0) return undefined
+  // Most of the log is signal: summarizing it is losing information to save
+  // bytes that are about to be worth having.
+  if (matched > lines.length / 2) return undefined
+  for (let i = 0; i < lines.length && hits.length < 12; i++) {
+    const line = lines[i].trimEnd()
+    if (!SIGNAL_LINES.some((rx) => rx.test(line))) continue
+    const clipped = clipBytes(line, 160)
+    if (seen.has(clipped)) continue
+    seen.add(clipped)
+    hits.push(clipped)
+    // The detail of a failure is the indented block under it: go test prints
+    // the assertion below `--- FAIL`, pytest prints the trace below the test
+    // name. Keeping the header without its detail keeps the fact that
+    // something broke and not what broke.
+    for (let j = i + 1; j < lines.length && j <= i + 3; j++) {
+      const next = lines[j].trimEnd()
+      if (!next || !/^\s/.test(next)) break
+      if (SIGNAL_LINES.some((rx) => rx.test(next))) break
+      const detail = clipBytes(next, 160)
+      if (seen.has(detail)) continue
+      seen.add(detail)
+      hits.push(detail)
+      if (hits.length >= 12) break
+    }
+  }
+
+  // The last line of a log is usually its summary ("3 failed, 1125 passed").
+  // An INDENTED last line is the detail of a block that was not kept, and
+  // quoting a fragment of it without its header is noise.
+  const tail: string[] = []
+  for (let i = lines.length - 1; i >= 0 && tail.length < 2; i--) {
+    const line = lines[i].trimEnd()
+    if (!line || /^\s/.test(line) || seen.has(line)) continue
+    tail.unshift(clipBytes(line, 120))
+  }
+
+  let pointer = ""
+  if (opts.keepFullOutput) {
+    const file = writeFullOutput(opts.directory, toolName, text)
+    if (file) pointer = ` Full output: ${formatMarkerPath(file)}`
+  }
+
+  const render = (h: string[], t: string[]) => {
+    const omitted = lines.length - h.length - t.length
+    return [
+      `[slim: ${total} bytes / ${lines.length} lines. ${h.length} signal line(s) kept, ${omitted} lines omitted.${pointer}]`,
+      ...h,
+      ...(t.length ? [`[slim: last ${t.length === 1 ? "line" : `${t.length} lines`}]`, ...t] : []),
+    ].join("\n")
+  }
+
+  // Beat the digest this replaces, or do not replace it. The loop drops the
+  // weakest lines rather than giving up, because one 160-byte stack frame at
+  // the end should not cost the whole summary.
+  const cap = Math.min(opts.headBytes, Math.max(400, Math.floor(total / 4)))
+  let out = render(hits, tail)
+  while (bytes(out) >= cap && (hits.length > 1 || tail.length > 0)) {
+    if (hits.length > 1) hits.pop()
+    else tail.pop()
+    out = render(hits, tail)
+  }
+  return bytes(out) < cap ? out : undefined
 }
 
 /**
@@ -1728,7 +1947,7 @@ export function digestJson(text: string, opts: SlimOptions, toolName: string) {
   let pointer = ""
   if (opts.keepFullOutput) {
     const file = writeFullOutput(opts.directory, toolName, text)
-    if (file) pointer = ` Full output: ${file}`
+    if (file) pointer = ` Full output: ${formatMarkerPath(file)}`
   }
 
   const note = truncated.length
@@ -1906,6 +2125,25 @@ export default {
     await ctx.session.hook("context", (event: any) => {
       const ledger = ledgerFor(event.sessionID)
       const messages = event.messages ?? []
+      // Resolve options from the host config here, rather than sharing one
+      // normalised object set at setup. A model with a small window must not
+      // inherit a 200 K model's budgets: a "stay warm" band of 32 KB is a
+      // third of a small window and would leave no room for anything else.
+      const opts = resolveOptions(ctx.options)
+      const modelContext = Number(
+        (event.model as any)?.limit?.context ??
+          (event.model as any)?.context ??
+          (event.model as any)?.context_limit ?? 0,
+      )
+      if (modelContext > 0 && modelContext < 200_000) {
+        const scale = Math.max(1 / 3, modelContext / 200_000)
+        opts.reasoningBytes = Math.floor(opts.reasoningBytes * scale)
+        opts.reasoningKeepBytes = Math.floor(opts.reasoningKeepBytes * scale)
+        opts.resultKeepBytes = Math.floor(opts.resultKeepBytes * scale)
+        opts.resultDigestBytes = Math.floor(opts.resultDigestBytes * scale)
+        opts.systemBytes = Math.floor(opts.systemBytes * scale)
+        opts.toolBytes = Math.floor(opts.toolBytes * scale)
+      }
 
       // 2z. Provider item ids.
       //
@@ -1919,22 +2157,40 @@ export default {
       //
       //     Only the listed providers are touched: a provider that owns a
       //     single resource validates the id itself and wants it back.
-      if (opts.stripItemIds.length > 0) {
-        const provider = (event.model as any)?.providerID
-        if (typeof provider === "string" && opts.stripItemIds.includes(provider)) {
-          for (const message of messages) {
-            if (!Array.isArray(message?.content)) continue
-            const kept = message.content.map((part: any) => stripItemId(part))
-            if (kept.some((part: any, i: number) => part !== message.content[i])) {
-              message.content = kept
-            }
+      const provider = (event.model as any)?.providerID
+      const shouldStripItemIds =
+        typeof provider === "string" &&
+        (opts.stripItemIds.includes(provider) ||
+          (opts.autoStripAgentRouter && /agentrouter/i.test(provider)))
+      if (shouldStripItemIds) {
+        for (const message of messages) {
+          if (!Array.isArray(message?.content)) continue
+          const kept = message.content.map((part: any) => stripItemId(part))
+          if (kept.some((part: any, i: number) => part !== message.content[i])) {
+            message.content = kept
           }
         }
       }
 
-      // The payload is the system prompt, the tool schemas and the messages.
-      // The tool schemas are part of every request, so leaving them out
-      // understates what was actually sent to the model.
+      // 2a. Opt-in prompt-cache markers. Anthropic bills cached reads at ~10%
+      //     of input price, so marking the stable prefix is the single biggest
+      //     cost lever this plugin can pull — but only a provider that understands
+      //     cache_control should ever see these fields. Disabled by default so
+      //     gateways that reject unknown keys keep working, and so default
+      //     behaviour stays exactly what was tested.
+      if (opts.cacheControl) {
+        const mark = (o: any) => {
+          if (o && typeof o === "object") o.cache_control = { type: "ephemeral" }
+        }
+        mark((event.system ?? []).at(-1))
+        for (const t of Object.values(event.tools ?? {})) mark(t)
+        // The most recent whole message ends the cached region: everything before
+        // it is historical, stable, and worth caching. Keep the turn itself
+        // uncached so a fresh prompt still gets full-quality replay.
+        const lastWhole = (event.messages ?? []).length - 2
+        if (lastWhole >= 0) mark((event.messages[lastWhole]?.content ?? [])[0])
+      }
+
       const toolsBytes = () =>
         Object.values((event.tools ?? {}) as Record<string, any>).reduce(
           (n: number, t: any) => n + bytes(t?.description ?? "") + bytes(JSON.stringify(t?.input ?? {})),
@@ -2132,7 +2388,9 @@ export default {
                 ? (elideToPointer(text, opts, name, size) ??
                   digestJson(text, opts, name) ??
                   digestResult(text, opts, name))
-                : (digestJson(text, opts, name) ?? digestResult(text, opts, name))
+                : (digestJson(text, opts, name) ??
+                  digestSignal(text, opts, name) ??
+                  digestResult(text, opts, name))
             if (replacement === undefined) {
               kept.push(live)
               continue
@@ -2184,9 +2442,12 @@ export default {
           //
           //     The call itself stays: the model needs to know it made the
           //     call. Only the arguments are trimmed, and only the bulky
-          //     string fields inside them. A `write` carries the whole file
-          //     in its arguments, and a session that writes ten files replays
-          //     all ten files on every turn forever.
+          //     string fields inside them.
+          //
+          //     `write`/`edit` calls are never trimmed: the model edits FROM
+          //     old write arguments, and a trimmed write is what gets copied
+          //     back into the file. Savings come from reads, which can always
+          //     be re-read from disk.
           //
           //     A protected path is never touched, and that includes the
           //     ARGUMENTS of a call about a protected path. Trimming them
@@ -2203,7 +2464,13 @@ export default {
               kept.push(part)
               continue
             }
-            const trimmed = trimCallInput(part.input)
+            // Writes are never trimmed: the model edits FROM old write args,
+            // and a trimmed write is what gets copied back into the file.
+            if (CALL_KEEP_WHOLE.has(part.name)) {
+              kept.push(part)
+              continue
+            }
+            const trimmed = trimCallInput(part.input, band === "elide")
             if (trimmed.changed) {
               // Counted once, like the reasoning and the results. The same
               // argument is re-sent on every request, so counting it every
@@ -2360,7 +2627,23 @@ export default {
         toolsBytes() +
         messages.reduce((n: number, m: any) => n + messageBytes(m), 0)
       ledger.bump({ requests: 1 })
-      ledger.set({ requestBefore: before, requestAfter: after })
+      // Fixed prefix hash: if the trimmed payload's head changes, the provider's
+      // prompt cache busts and every turn re-bills at full price. The bytes are
+      // already measured; hashing the first 8 KB is the cheap stand-in.
+      let prefixAcc = ""
+      for (const p of event.system ?? []) prefixAcc += (p.text ?? "").toString()
+      for (const [k, t] of Object.entries(event.tools ?? {})) prefixAcc += `${k}${(t as any).description ?? ""}`
+      for (const m of event.messages ?? []) {
+        for (const p of m.content ?? []) prefixAcc += JSON.stringify(p)
+        if (Buffer.byteLength(prefixAcc) > 8000) break
+      }
+      const currentPrefixHash = createHash("sha256").update(prefixAcc.slice(0, 8000)).digest("hex")
+      const _currentCacheBusts = ledger.get().cacheBusts
+      const busts = ledger.get().prevPrefixHash !== "" && ledger.get().prevPrefixHash !== currentPrefixHash
+        ? _currentCacheBusts + 1
+        : _currentCacheBusts
+      ledger.set({ requestBefore: before, requestAfter: after, prevPrefixHash: currentPrefixHash, cacheBusts: busts })
+
       // The peak is the largest payload this session would have sent with
       // nothing trimmed. The trimmed size of THAT SAME request is kept with
       // it: comparing the largest untrimmed payload against the most recent
@@ -2465,6 +2748,16 @@ export default {
           `  ${s.snipCommands} command(s), ${fmt(s.snipBytesFiltered)} of output sent to the model`,
           "  (snip keeps its own ledger: run `snip gain` for the bytes it removed)",
         )
+      }
+      if ((s.cacheBusts ?? 0) > 0) {
+        lines.push(
+          "",
+          "Prompt-cache busts:",
+          `  ${s.cacheBusts} of ${s.requests} request(s) (last trimmed payload differed from the previous one in its first 8 KB - bail out or shrink the step)`,
+        )
+      }
+      if (opts.cacheControl) {
+        lines.push(`  cache_control markers: on (ephemeral)`)
       }
       const byTool = Object.entries(s.byTool).sort((a, b) => b[1] - a[1])
       if (byTool.length > 0) {

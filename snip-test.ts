@@ -81,4 +81,36 @@ import { repairSnipCommand } from "./index.ts"
   assert.equal(repairSnipCommand('"C:\\\\x\\\\snip.exe', ""), '"C:\\\\x\\\\snip.exe')
 }
 
+// --- 7. every segment of a `;` chain is repaired -----------------------------
+{
+  // snip repeats its own path on every segment. A repair that fixes only the
+  // first leaves a bare quoted path mid-line, and PowerShell rejects it with
+  // "Unexpected token 'run'". Both paths must become runnable.
+  const chain =
+    '"C:\\\\Users\\\\me\\\\go\\\\bin\\\\snip.exe" run -- git grep -l "run-relay" -- . ; ' +
+    '"C:\\\\Users\\\\me\\\\go\\\\bin\\\\snip.exe" run -- git grep -l "layout-lab" -- .'
+  assert.equal(
+    repairSnipCommand(chain, ""),
+    'snip run -- git grep -l "run-relay" -- . ; snip run -- git grep -l "layout-lab" -- .',
+  )
+  // A grep pattern naming snip mid-command is an argument, not a binary path,
+  // and must survive verbatim.
+  const pattern =
+    '"C:\\\\x\\\\snip.exe" run -- git grep -l "snip" -- . ; ' +
+    '"C:\\\\x\\\\snip.exe" run -- git grep -l "svgPath" -- tests src'
+  assert.equal(
+    repairSnipCommand(pattern, ""),
+    'snip run -- git grep -l "snip" -- . ; snip run -- git grep -l "svgPath" -- tests src',
+  )
+  // A `;` inside quotes is part of the argument, not a separator.
+  const quotedSemi = '"C:\\\\x\\\\snip.exe" run -- git grep -l "a;b" -- .'
+  assert.equal(repairSnipCommand(quotedSemi, ""), 'snip run -- git grep -l "a;b" -- .')
+  // An explicit spaced path keeps PowerShell's `&` on every segment.
+  const spaced = "C:\\Program Files\\snip.exe"
+  assert.equal(
+    repairSnipCommand(chain, spaced, "powershell.exe"),
+    '& "C:/Program Files/snip.exe" run -- git grep -l "run-relay" -- . ; & "C:/Program Files/snip.exe" run -- git grep -l "layout-lab" -- .',
+  )
+}
+
 console.log("all checks passed")
